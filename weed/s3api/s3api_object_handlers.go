@@ -305,6 +305,11 @@ func (s3a *S3ApiServer) proxyToFiler(w http.ResponseWriter, r *http.Request, des
 			return
 		}
 	}
+	if (r.Method == "GET" && resp.StatusCode == 204) {
+		writeSuccessResponseEmpty(w)
+		return
+	}
+
 
 	responseFn(resp, w)
 
