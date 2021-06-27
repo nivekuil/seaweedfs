@@ -103,3 +103,5 @@ require (
 // replace github.com/chrislusf/raft => /Users/chris/go/src/github.com/chrislusf/raft
 
 replace go.etcd.io/etcd => go.etcd.io/etcd v0.5.0-alpha.5.0.20200425165423-262c93980547
+
+replace github.com/gocql/gocql => github.com/scylladb/gocql v1.4.4-0.20210127085005-3af286340003
