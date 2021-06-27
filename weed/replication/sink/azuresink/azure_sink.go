@@ -18,10 +18,11 @@ import (
 )
 
 type AzureSink struct {
-	containerURL azblob.ContainerURL
-	container    string
-	dir          string
-	filerSource  *source.FilerSource
+	containerURL  azblob.ContainerURL
+	container     string
+	dir           string
+	filerSource   *source.FilerSource
+	isIncremental bool
 }
 
 func init() {
@@ -36,7 +37,12 @@ func (g *AzureSink) GetSinkToDirectory() string {
 	return g.dir
 }
 
+func (g *AzureSink) IsIncremental() bool {
+	return g.isIncremental
+}
+
 func (g *AzureSink) Initialize(configuration util.Configuration, prefix string) error {
+	g.isIncremental = configuration.GetBool(prefix + "is_incremental")
 	return g.initialize(
 		configuration.GetString(prefix+"account_name"),
 		configuration.GetString(prefix+"account_key"),
@@ -123,8 +129,7 @@ func (g *AzureSink) CreateEntry(key string, entry *filer_pb.Entry, signatures []
 
 func (g *AzureSink) UpdateEntry(key string, oldEntry *filer_pb.Entry, newParentPath string, newEntry *filer_pb.Entry, deleteIncludeChunks bool, signatures []int32) (foundExistingEntry bool, err error) {
 	key = cleanKey(key)
-	// TODO improve efficiency
-	return false, nil
+	return true, g.CreateEntry(key, newEntry, signatures)
 }
 
 func cleanKey(key string) string {

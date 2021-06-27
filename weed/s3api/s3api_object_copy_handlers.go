@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"github.com/chrislusf/seaweedfs/weed/glog"
 	"github.com/chrislusf/seaweedfs/weed/s3api/s3err"
+	weed_server "github.com/chrislusf/seaweedfs/weed/server"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -25,14 +26,34 @@ func (s3a *S3ApiServer) CopyObjectHandler(w http.ResponseWriter, r *http.Request
 	}
 
 	srcBucket, srcObject := pathToBucketAndObject(cpSrcPath)
+
+	if (srcBucket == dstBucket && srcObject == dstObject || cpSrcPath == "") && isReplace(r) {
+		fullPath := util.FullPath(fmt.Sprintf("%s/%s%s", s3a.option.BucketsPath, dstBucket, dstObject))
+		dir, name := fullPath.DirAndName()
+		entry, err := s3a.getEntry(dir, name)
+		if err != nil {
+			s3err.WriteErrorResponse(w, s3err.ErrInvalidCopySource, r)
+		}
+		entry.Extended = weed_server.SaveAmzMetaData(r, entry.Extended, isReplace(r))
+		err = s3a.touch(dir, name, entry)
+		if err != nil {
+			s3err.WriteErrorResponse(w, s3err.ErrInvalidCopySource, r)
+		}
+		writeSuccessResponseXML(w, CopyObjectResult{
+			ETag:         fmt.Sprintf("%x", entry.Attributes.Md5),
+			LastModified: time.Now().UTC(),
+		})
+		return
+	}
+
 	// If source object is empty or bucket is empty, reply back invalid copy source.
 	if srcObject == "" || srcBucket == "" {
-		writeErrorResponse(w, s3err.ErrInvalidCopySource, r.URL)
+		s3err.WriteErrorResponse(w, s3err.ErrInvalidCopySource, r)
 		return
 	}
 
 	if srcBucket == dstBucket && srcObject == dstObject {
-		writeErrorResponse(w, s3err.ErrInvalidCopySource, r.URL)
+		s3err.WriteErrorResponse(w, s3err.ErrInvalidCopyDest, r)
 		return
 	}
 
@@ -43,7 +64,7 @@ func (s3a *S3ApiServer) CopyObjectHandler(w http.ResponseWriter, r *http.Request
 
 	_, _, resp, err := util.DownloadFile(srcUrl)
 	if err != nil {
-		writeErrorResponse(w, s3err.ErrInvalidCopySource, r.URL)
+		s3err.WriteErrorResponse(w, s3err.ErrInvalidCopySource, r)
 		return
 	}
 	defer util.CloseResponse(resp)
@@ -52,7 +73,7 @@ func (s3a *S3ApiServer) CopyObjectHandler(w http.ResponseWriter, r *http.Request
 	etag, errCode := s3a.putToFiler(r, dstUrl, resp.Body)
 
 	if errCode != s3err.ErrNone {
-		writeErrorResponse(w, errCode, r.URL)
+		s3err.WriteErrorResponse(w, errCode, r)
 		return
 	}
 
@@ -63,7 +84,7 @@ func (s3a *S3ApiServer) CopyObjectHandler(w http.ResponseWriter, r *http.Request
 		LastModified: time.Now().UTC(),
 	}
 
-	writeSuccessResponseXML(w, encodeResponse(response))
+	writeSuccessResponseXML(w, response)
 
 }
 
@@ -96,7 +117,7 @@ func (s3a *S3ApiServer) CopyObjectPartHandler(w http.ResponseWriter, r *http.Req
 	srcBucket, srcObject := pathToBucketAndObject(cpSrcPath)
 	// If source object is empty or bucket is empty, reply back invalid copy source.
 	if srcObject == "" || srcBucket == "" {
-		writeErrorResponse(w, s3err.ErrInvalidCopySource, r.URL)
+		s3err.WriteErrorResponse(w, s3err.ErrInvalidCopySource, r)
 		return
 	}
 
@@ -105,13 +126,13 @@ func (s3a *S3ApiServer) CopyObjectPartHandler(w http.ResponseWriter, r *http.Req
 
 	partID, err := strconv.Atoi(partIDString)
 	if err != nil {
-		writeErrorResponse(w, s3err.ErrInvalidPart, r.URL)
+		s3err.WriteErrorResponse(w, s3err.ErrInvalidPart, r)
 		return
 	}
 
 	// check partID with maximum part ID for multipart objects
 	if partID > globalMaxPartID {
-		writeErrorResponse(w, s3err.ErrInvalidMaxParts, r.URL)
+		s3err.WriteErrorResponse(w, s3err.ErrInvalidMaxParts, r)
 		return
 	}
 
@@ -124,7 +145,7 @@ func (s3a *S3ApiServer) CopyObjectPartHandler(w http.ResponseWriter, r *http.Req
 
 	dataReader, err := util.ReadUrlAsReaderCloser(srcUrl, rangeHeader)
 	if err != nil {
-		writeErrorResponse(w, s3err.ErrInvalidCopySource, r.URL)
+		s3err.WriteErrorResponse(w, s3err.ErrInvalidCopySource, r)
 		return
 	}
 	defer dataReader.Close()
@@ -133,7 +154,7 @@ func (s3a *S3ApiServer) CopyObjectPartHandler(w http.ResponseWriter, r *http.Req
 	etag, errCode := s3a.putToFiler(r, dstUrl, dataReader)
 
 	if errCode != s3err.ErrNone {
-		writeErrorResponse(w, errCode, r.URL)
+		s3err.WriteErrorResponse(w, errCode, r)
 		return
 	}
 
@@ -144,6 +165,10 @@ func (s3a *S3ApiServer) CopyObjectPartHandler(w http.ResponseWriter, r *http.Req
 		LastModified: time.Now().UTC(),
 	}
 
-	writeSuccessResponseXML(w, encodeResponse(response))
+	writeSuccessResponseXML(w, response)
 
+}
+
+func isReplace(r *http.Request) bool {
+	return r.Header.Get("X-Amz-Metadata-Directive") == "REPLACE"
 }

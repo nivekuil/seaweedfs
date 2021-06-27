@@ -2,6 +2,7 @@ package storage
 
 import (
 	"fmt"
+	"github.com/chrislusf/seaweedfs/weed/util"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -52,11 +53,12 @@ func (s *Store) String() (str string) {
 	return
 }
 
-func NewStore(grpcDialOption grpc.DialOption, port int, ip, publicUrl string, dirnames []string, maxVolumeCounts []int, minFreeSpacePercents []float32, idxFolder string, needleMapKind NeedleMapKind, diskTypes []DiskType) (s *Store) {
+func NewStore(grpcDialOption grpc.DialOption, port int, ip, publicUrl string, dirnames []string, maxVolumeCounts []int,
+	minFreeSpaces []util.MinFreeSpace, idxFolder string, needleMapKind NeedleMapKind, diskTypes []DiskType) (s *Store) {
 	s = &Store{grpcDialOption: grpcDialOption, Port: port, Ip: ip, PublicUrl: publicUrl, NeedleMapKind: needleMapKind}
 	s.Locations = make([]*DiskLocation, 0)
 	for i := 0; i < len(dirnames); i++ {
-		location := NewDiskLocation(dirnames[i], maxVolumeCounts[i], minFreeSpacePercents[i], idxFolder, diskTypes[i])
+		location := NewDiskLocation(dirnames[i], maxVolumeCounts[i], minFreeSpaces[i], idxFolder, diskTypes[i])
 		location.loadExistingVolumes(needleMapKind)
 		s.Locations = append(s.Locations, location)
 		stats.VolumeServerMaxVolumeCounter.Add(float64(maxVolumeCounts[i]))
@@ -104,6 +106,9 @@ func (s *Store) FindFreeLocation(diskType DiskType) (ret *DiskLocation) {
 	max := 0
 	for _, location := range s.Locations {
 		if diskType != location.DiskType {
+			continue
+		}
+		if location.isDiskSpaceLow {
 			continue
 		}
 		currentFreeCount := location.MaxVolumeCount - location.VolumesLen()
@@ -217,23 +222,41 @@ func (s *Store) CollectHeartbeat() *master_pb.Heartbeat {
 		location.volumesLock.RLock()
 		for _, v := range location.volumes {
 			curMaxFileKey, volumeMessage := v.ToVolumeInformationMessage()
+			if volumeMessage == nil {
+				continue
+			}
 			if maxFileKey < curMaxFileKey {
 				maxFileKey = curMaxFileKey
 			}
+			deleteVolume := false
 			if !v.expired(volumeMessage.Size, s.GetVolumeSizeLimit()) {
 				volumeMessages = append(volumeMessages, volumeMessage)
 			} else {
 				if v.expiredLongEnough(MAX_TTL_VOLUME_REMOVAL_DELAY) {
 					deleteVids = append(deleteVids, v.Id)
+					deleteVolume = true
 				} else {
 					glog.V(0).Infof("volume %d is expired", v.Id)
 				}
 				if v.lastIoError != nil {
 					deleteVids = append(deleteVids, v.Id)
+					deleteVolume = true
 					glog.Warningf("volume %d has IO error: %v", v.Id, v.lastIoError)
 				}
 			}
-			collectionVolumeSize[v.Collection] += volumeMessage.Size
+
+			if _, exist := collectionVolumeSize[v.Collection]; !exist {
+				collectionVolumeSize[v.Collection] = 0
+			}
+			if !deleteVolume {
+				collectionVolumeSize[v.Collection] += volumeMessage.Size
+			} else {
+				collectionVolumeSize[v.Collection] -= volumeMessage.Size
+				if collectionVolumeSize[v.Collection] <= 0 {
+					delete(collectionVolumeSize, v.Collection)
+				}
+			}
+
 			if _, exist := collectionVolumeReadOnlyCount[v.Collection]; !exist {
 				collectionVolumeReadOnlyCount[v.Collection] = map[string]uint8{
 					"IsReadOnly":       0,
@@ -242,7 +265,7 @@ func (s *Store) CollectHeartbeat() *master_pb.Heartbeat {
 					"isDiskSpaceLow":   0,
 				}
 			}
-			if v.IsReadOnly() {
+			if !deleteVolume && v.IsReadOnly() {
 				collectionVolumeReadOnlyCount[v.Collection]["IsReadOnly"] += 1
 				if v.noWriteOrDelete {
 					collectionVolumeReadOnlyCount[v.Collection]["noWriteOrDelete"] += 1
@@ -267,7 +290,7 @@ func (s *Store) CollectHeartbeat() *master_pb.Heartbeat {
 						glog.V(0).Infof("volume %d is deleted", vid)
 					}
 				} else {
-					glog.V(0).Infof("delete volume %d: %v", vid, err)
+					glog.Warningf("delete volume %d: %v", vid, err)
 				}
 			}
 			location.volumesLock.Unlock()
@@ -446,7 +469,7 @@ func (s *Store) ConfigureVolume(i needle.VolumeId, replication string) error {
 		// load, modify, save
 		baseFileName := strings.TrimSuffix(fileInfo.Name(), filepath.Ext(fileInfo.Name()))
 		vifFile := filepath.Join(location.Directory, baseFileName+".vif")
-		volumeInfo, _, err := pb.MaybeLoadVolumeInfo(vifFile)
+		volumeInfo, _, _, err := pb.MaybeLoadVolumeInfo(vifFile)
 		if err != nil {
 			return fmt.Errorf("volume %d fail to load vif", i)
 		}

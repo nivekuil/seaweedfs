@@ -42,6 +42,10 @@ func NewOnDiskCacheLayer(dir, namePrefix string, diskSize int64, segmentCount in
 
 func (c *OnDiskCacheLayer) setChunk(needleId types.NeedleId, data []byte) {
 
+	if len(c.diskCaches) == 0 {
+		return
+	}
+
 	if c.diskCaches[0].fileSize+int64(len(data)) > c.diskCaches[0].sizeLimit {
 		t, resetErr := c.diskCaches[len(c.diskCaches)-1].Reset()
 		if resetErr != nil {
@@ -66,6 +70,28 @@ func (c *OnDiskCacheLayer) getChunk(needleId types.NeedleId) (data []byte) {
 
 	for _, diskCache := range c.diskCaches {
 		data, err = diskCache.GetNeedle(needleId)
+		if err == storage.ErrorNotFound {
+			continue
+		}
+		if err != nil {
+			glog.Errorf("failed to read cache file %s id %d", diskCache.fileName, needleId)
+			continue
+		}
+		if len(data) != 0 {
+			return
+		}
+	}
+
+	return nil
+
+}
+
+func (c *OnDiskCacheLayer) getChunkSlice(needleId types.NeedleId, offset, length uint64) (data []byte) {
+
+	var err error
+
+	for _, diskCache := range c.diskCaches {
+		data, err = diskCache.getNeedleSlice(needleId, offset, length)
 		if err == storage.ErrorNotFound {
 			continue
 		}

@@ -18,10 +18,11 @@ import (
 )
 
 type GcsSink struct {
-	client      *storage.Client
-	bucket      string
-	dir         string
-	filerSource *source.FilerSource
+	client        *storage.Client
+	bucket        string
+	dir           string
+	filerSource   *source.FilerSource
+	isIncremental bool
 }
 
 func init() {
@@ -36,7 +37,12 @@ func (g *GcsSink) GetSinkToDirectory() string {
 	return g.dir
 }
 
+func (g *GcsSink) IsIncremental() bool {
+	return g.isIncremental
+}
+
 func (g *GcsSink) Initialize(configuration util.Configuration, prefix string) error {
+	g.isIncremental = configuration.GetBool(prefix + "is_incremental")
 	return g.initialize(
 		configuration.GetString(prefix+"google_application_credentials"),
 		configuration.GetString(prefix+"bucket"),
@@ -110,6 +116,5 @@ func (g *GcsSink) CreateEntry(key string, entry *filer_pb.Entry, signatures []in
 }
 
 func (g *GcsSink) UpdateEntry(key string, oldEntry *filer_pb.Entry, newParentPath string, newEntry *filer_pb.Entry, deleteIncludeChunks bool, signatures []int32) (foundExistingEntry bool, err error) {
-	// TODO improve efficiency
-	return false, nil
+	return true, g.CreateEntry(key, newEntry, signatures)
 }

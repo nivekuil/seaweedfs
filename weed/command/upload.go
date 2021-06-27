@@ -43,7 +43,7 @@ func init() {
 	upload.dataCenter = cmdUpload.Flag.String("dataCenter", "", "optional data center name")
 	upload.diskType = cmdUpload.Flag.String("disk", "", "[hdd|ssd|<tag>] hard drive or solid state drive or any tag")
 	upload.ttl = cmdUpload.Flag.String("ttl", "", "time to live, e.g.: 1m, 1h, 1d, 1M, 1y")
-	upload.maxMB = cmdUpload.Flag.Int("maxMB", 32, "split files larger than the limit")
+	upload.maxMB = cmdUpload.Flag.Int("maxMB", 4, "split files larger than the limit")
 	upload.usePublicUrl = cmdUpload.Flag.Bool("usePublicUrl", false, "upload to public url from volume server")
 }
 
@@ -84,7 +84,7 @@ func runUpload(cmd *Command, args []string) bool {
 		if *upload.dir == "" {
 			return false
 		}
-		filepath.Walk(util.ResolvePath(*upload.dir), func(path string, info os.FileInfo, err error) error {
+		err = filepath.Walk(util.ResolvePath(*upload.dir), func(path string, info os.FileInfo, err error) error {
 			if err == nil {
 				if !info.IsDir() {
 					if *upload.include != "" {
@@ -108,12 +108,21 @@ func runUpload(cmd *Command, args []string) bool {
 			}
 			return err
 		})
+		if err != nil {
+			fmt.Println(err.Error())
+			return false;
+		}
 	} else {
 		parts, e := operation.NewFileParts(args)
 		if e != nil {
 			fmt.Println(e.Error())
+			return false
 		}
-		results, _ := operation.SubmitFiles(func() string { return *upload.master }, grpcDialOption, parts, *upload.replication, *upload.collection, *upload.dataCenter, *upload.ttl, *upload.diskType, *upload.maxMB, *upload.usePublicUrl)
+		results, err := operation.SubmitFiles(func() string { return *upload.master }, grpcDialOption, parts, *upload.replication, *upload.collection, *upload.dataCenter, *upload.ttl, *upload.diskType, *upload.maxMB, *upload.usePublicUrl)
+		if err != nil {
+			fmt.Println(err.Error())
+			return false
+		}
 		bytes, _ := json.Marshal(results)
 		fmt.Println(string(bytes))
 	}

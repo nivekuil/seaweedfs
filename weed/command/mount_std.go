@@ -5,14 +5,17 @@ package command
 import (
 	"context"
 	"fmt"
-	"github.com/chrislusf/seaweedfs/weed/storage/types"
 	"os"
 	"os/user"
 	"path"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
+
+	"github.com/chrislusf/seaweedfs/weed/storage/types"
 
 	"github.com/chrislusf/seaweedfs/weed/filesys/meta_cache"
 
@@ -49,11 +52,26 @@ func runMount(cmd *Command, args []string) bool {
 	return RunMount(&mountOptions, os.FileMode(umask))
 }
 
+func getParentInode(mountDir string) (uint64, error) {
+	parentDir := filepath.Clean(filepath.Join(mountDir, ".."))
+	fi, err := os.Stat(parentDir)
+	if err != nil {
+		return 0, err
+	}
+
+	stat, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, nil
+	}
+
+	return stat.Ino, nil
+}
+
 func RunMount(option *MountOptions, umask os.FileMode) bool {
 
-	filer := *option.filer
+	filers := strings.Split(*option.filer, ",")
 	// parse filer grpc address
-	filerGrpcAddress, err := pb.ParseFilerGrpcAddress(filer)
+	filerGrpcAddresses, err := pb.ParseServersToGrpcAddresses(filers)
 	if err != nil {
 		glog.V(0).Infof("ParseFilerGrpcAddress: %v", err)
 		return true
@@ -63,28 +81,41 @@ func RunMount(option *MountOptions, umask os.FileMode) bool {
 	// try to connect to filer, filerBucketsPath may be useful later
 	grpcDialOption := security.LoadClientTLS(util.GetViper(), "grpc.client")
 	var cipher bool
-	err = pb.WithGrpcFilerClient(filerGrpcAddress, grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
-		resp, err := client.GetFilerConfiguration(context.Background(), &filer_pb.GetFilerConfigurationRequest{})
+	for i := 0; i < 10; i++ {
+		err = pb.WithOneOfGrpcFilerClients(filerGrpcAddresses, grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
+			resp, err := client.GetFilerConfiguration(context.Background(), &filer_pb.GetFilerConfigurationRequest{})
+			if err != nil {
+				return fmt.Errorf("get filer grpc address %v configuration: %v", filerGrpcAddresses, err)
+			}
+			cipher = resp.Cipher
+			return nil
+		})
 		if err != nil {
-			return fmt.Errorf("get filer grpc address %s configuration: %v", filerGrpcAddress, err)
+			glog.V(0).Infof("failed to talk to filer %v: %v", filerGrpcAddresses, err)
+			glog.V(0).Infof("wait for %d seconds ...", i+1)
+			time.Sleep(time.Duration(i+1) * time.Second)
 		}
-		cipher = resp.Cipher
-		return nil
-	})
+	}
 	if err != nil {
-		glog.Infof("failed to talk to filer %s: %v", filerGrpcAddress, err)
+		glog.Errorf("failed to talk to filer %v: %v", filerGrpcAddresses, err)
 		return true
 	}
 
 	filerMountRootPath := *option.filerMountRootPath
 	dir := util.ResolvePath(*option.dir)
-	chunkSizeLimitMB := *mountOptions.chunkSizeLimitMB
+	parentInode, err := getParentInode(dir)
+	if err != nil {
+		glog.Errorf("failed to retrieve inode for parent directory of %s: %v", dir, err)
+		return true
+	}
 
 	fmt.Printf("This is SeaweedFS version %s %s %s\n", util.Version(), runtime.GOOS, runtime.GOARCH)
 	if dir == "" {
 		fmt.Printf("Please specify the mount directory via \"-dir\"")
 		return false
 	}
+
+	chunkSizeLimitMB := *mountOptions.chunkSizeLimitMB
 	if chunkSizeLimitMB <= 0 {
 		fmt.Printf("Please specify a reasonable buffer size.")
 		return false
@@ -138,12 +169,10 @@ func RunMount(option *MountOptions, umask os.FileMode) bool {
 
 	options := []fuse.MountOption{
 		fuse.VolumeName(mountName),
-		fuse.FSName(filer + ":" + filerMountRootPath),
+		fuse.FSName(*option.filer + ":" + filerMountRootPath),
 		fuse.Subtype("seaweedfs"),
 		// fuse.NoAppleDouble(), // include .DS_Store, otherwise can not delete non-empty folders
 		fuse.NoAppleXattr(),
-		fuse.NoBrowse(),
-		fuse.AutoXattr(),
 		fuse.ExclCreate(),
 		fuse.DaemonTimeout("3600"),
 		fuse.AllowSUID(),
@@ -162,6 +191,9 @@ func RunMount(option *MountOptions, umask os.FileMode) bool {
 	if *option.nonempty {
 		options = append(options, fuse.AllowNonEmptyMount())
 	}
+	if *option.readOnly {
+		options = append(options, fuse.ReadOnly())
+	}
 
 	// find mount point
 	mountRoot := filerMountRootPath
@@ -173,8 +205,8 @@ func RunMount(option *MountOptions, umask os.FileMode) bool {
 
 	seaweedFileSystem := filesys.NewSeaweedFileSystem(&filesys.Option{
 		MountDirectory:     dir,
-		FilerAddress:       filer,
-		FilerGrpcAddress:   filerGrpcAddress,
+		FilerAddresses:     filers,
+		FilerGrpcAddresses: filerGrpcAddresses,
 		GrpcDialOption:     grpcDialOption,
 		FilerMountRootPath: mountRoot,
 		Collection:         *option.collection,
@@ -186,12 +218,12 @@ func RunMount(option *MountOptions, umask os.FileMode) bool {
 		CacheDir:           *option.cacheDir,
 		CacheSizeMB:        *option.cacheSizeMB,
 		DataCenter:         *option.dataCenter,
-		EntryCacheTtl:      3 * time.Second,
 		MountUid:           uid,
 		MountGid:           gid,
 		MountMode:          mountMode,
 		MountCtime:         fileInfo.ModTime(),
 		MountMtime:         time.Now(),
+		MountParentInode:   parentInode,
 		Umask:              umask,
 		VolumeServerAccess: *mountOptions.volumeServerAccess,
 		Cipher:             cipher,
@@ -211,9 +243,10 @@ func RunMount(option *MountOptions, umask os.FileMode) bool {
 		c.Close()
 	})
 
-	glog.V(0).Infof("mounted %s%s to %s", filer, mountRoot, dir)
+	glog.V(0).Infof("mounted %s%s to %v", *option.filer, mountRoot, dir)
 	server := fs.New(c, nil)
 	seaweedFileSystem.Server = server
+	seaweedFileSystem.StartBackgroundTasks()
 	err = server.Serve(seaweedFileSystem)
 
 	// check if the mount process has an error to report

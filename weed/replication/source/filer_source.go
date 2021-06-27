@@ -58,7 +58,6 @@ func (fs *FilerSource) LookupFileId(part string) (fileUrls []string, err error) 
 
 	err = fs.WithFilerClient(func(client filer_pb.SeaweedFilerClient) error {
 
-		glog.V(4).Infof("read lookup volume id locations: %v", vid)
 		resp, err := client.LookupVolume(context.Background(), &filer_pb.LookupVolumeRequest{
 			VolumeIds: []string{vid},
 		})
@@ -83,8 +82,12 @@ func (fs *FilerSource) LookupFileId(part string) (fileUrls []string, err error) 
 		return nil, fmt.Errorf("LookupFileId locate volume id %s: %v", vid, err)
 	}
 
-	for _, loc := range locations.Locations {
-		fileUrls = append(fileUrls, fmt.Sprintf("http://%s/%s", loc.Url, part))
+	if !fs.proxyByFiler {
+		for _, loc := range locations.Locations {
+			fileUrls = append(fileUrls, fmt.Sprintf("http://%s/%s?readDeleted=true", loc.Url, part))
+		}
+	} else {
+		fileUrls = append(fileUrls, fmt.Sprintf("http://%s/?proxyChunkId=%s", fs.address, part))
 	}
 
 	return

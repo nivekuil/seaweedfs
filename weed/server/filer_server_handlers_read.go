@@ -40,7 +40,7 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request, 
 			stats.FilerRequestCounter.WithLabelValues("read.notfound").Inc()
 			w.WriteHeader(http.StatusNotFound)
 		} else {
-			glog.V(0).Infof("Internal %s: %v", path, err)
+			glog.Errorf("Internal %s: %v", path, err)
 			stats.FilerRequestCounter.WithLabelValues("read.internalerror").Inc()
 			w.WriteHeader(http.StatusInternalServerError)
 		}
@@ -58,6 +58,13 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request, 
 
 	if isForDirectory {
 		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	// set etag
+	etag := filer.ETagEntry(entry)
+	if ifm := r.Header.Get("If-Match"); ifm != "" && ifm != "\""+etag+"\"" {
+		w.WriteHeader(http.StatusPreconditionFailed)
 		return
 	}
 
@@ -79,7 +86,7 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request, 
 		w.Header().Set("Last-Modified", entry.Attr.Mtime.UTC().Format(http.TimeFormat))
 		if r.Header.Get("If-Modified-Since") != "" {
 			if t, parseError := time.Parse(http.TimeFormat, r.Header.Get("If-Modified-Since")); parseError == nil {
-				if t.After(entry.Attr.Mtime) {
+				if !t.Before(entry.Attr.Mtime) {
 					w.WriteHeader(http.StatusNotModified)
 					return
 				}
@@ -115,8 +122,6 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request, 
 		}
 	}
 
-	// set etag
-	etag := filer.ETagEntry(entry)
 	if inm := r.Header.Get("If-None-Match"); inm == "\""+etag+"\"" {
 		w.WriteHeader(http.StatusNotModified)
 		return
@@ -150,15 +155,18 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request, 
 		}
 	}
 
-	processRangeRequest(r, w, totalSize, mimeType, func(writer io.Writer, offset int64, size int64, httpStatusCode int) error {
-		if httpStatusCode != 0 {
-			w.WriteHeader(httpStatusCode)
-		}
+	processRangeRequest(r, w, totalSize, mimeType, func(writer io.Writer, offset int64, size int64) error {
 		if offset+size <= int64(len(entry.Content)) {
 			_, err := writer.Write(entry.Content[offset : offset+size])
+			if err != nil {
+				glog.Errorf("failed to write entry content: %v", err)
+			}
 			return err
 		}
-		return filer.StreamContent(fs.filer.MasterClient, writer, entry.Chunks, offset, size)
+		err = filer.StreamContent(fs.filer.MasterClient, writer, entry.Chunks, offset, size)
+		if err != nil {
+			glog.Errorf("failed to stream content %s: %v", r.URL, err)
+		}
+		return err
 	})
-
 }

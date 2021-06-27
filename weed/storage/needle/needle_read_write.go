@@ -1,15 +1,16 @@
 package needle
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
-	"io"
-	"math"
-
 	"github.com/chrislusf/seaweedfs/weed/glog"
 	"github.com/chrislusf/seaweedfs/weed/storage/backend"
 	. "github.com/chrislusf/seaweedfs/weed/storage/types"
 	"github.com/chrislusf/seaweedfs/weed/util"
+	"io"
+	"math"
+	"sync"
 )
 
 const (
@@ -30,10 +31,14 @@ func (n *Needle) DiskSize(version Version) int64 {
 	return GetActualSize(n.Size, version)
 }
 
-func (n *Needle) prepareWriteBuffer(version Version) ([]byte, Size, int64, error) {
+var bufPool = sync.Pool{
+	New: func() interface{} {
+		return new(bytes.Buffer)
+	},
+}
 
-	writeBytes := make([]byte, 0)
-
+func (n *Needle) prepareWriteBuffer(version Version, writeBytes *bytes.Buffer) (Size, int64, error) {
+	writeBytes.Reset()
 	switch version {
 	case Version1:
 		header := make([]byte, NeedleHeaderSize)
@@ -43,12 +48,12 @@ func (n *Needle) prepareWriteBuffer(version Version) ([]byte, Size, int64, error
 		SizeToBytes(header[CookieSize+NeedleIdSize:CookieSize+NeedleIdSize+SizeSize], n.Size)
 		size := n.Size
 		actualSize := NeedleHeaderSize + int64(n.Size)
-		writeBytes = append(writeBytes, header...)
-		writeBytes = append(writeBytes, n.Data...)
+		writeBytes.Write(header)
+		writeBytes.Write(n.Data)
 		padding := PaddingLength(n.Size, version)
 		util.Uint32toBytes(header[0:NeedleChecksumSize], n.Checksum.Value())
-		writeBytes = append(writeBytes, header[0:NeedleChecksumSize+padding]...)
-		return writeBytes, size, actualSize, nil
+		writeBytes.Write(header[0:NeedleChecksumSize+padding])
+		return size, actualSize, nil
 	case Version2, Version3:
 		header := make([]byte, NeedleHeaderSize+TimestampSize) // adding timestamp to reuse it and avoid extra allocation
 		CookieToBytes(header[0:CookieSize], n.Cookie)
@@ -80,51 +85,51 @@ func (n *Needle) prepareWriteBuffer(version Version) ([]byte, Size, int64, error
 			n.Size = 0
 		}
 		SizeToBytes(header[CookieSize+NeedleIdSize:CookieSize+NeedleIdSize+SizeSize], n.Size)
-		writeBytes = append(writeBytes, header[0:NeedleHeaderSize]...)
+		writeBytes.Write(header[0:NeedleHeaderSize])
 		if n.DataSize > 0 {
 			util.Uint32toBytes(header[0:4], n.DataSize)
-			writeBytes = append(writeBytes, header[0:4]...)
-			writeBytes = append(writeBytes, n.Data...)
+			writeBytes.Write(header[0:4])
+			writeBytes.Write(n.Data)
 			util.Uint8toBytes(header[0:1], n.Flags)
-			writeBytes = append(writeBytes, header[0:1]...)
+			writeBytes.Write(header[0:1])
 			if n.HasName() {
 				util.Uint8toBytes(header[0:1], n.NameSize)
-				writeBytes = append(writeBytes, header[0:1]...)
-				writeBytes = append(writeBytes, n.Name[:n.NameSize]...)
+				writeBytes.Write(header[0:1])
+				writeBytes.Write(n.Name[:n.NameSize])
 			}
 			if n.HasMime() {
 				util.Uint8toBytes(header[0:1], n.MimeSize)
-				writeBytes = append(writeBytes, header[0:1]...)
-				writeBytes = append(writeBytes, n.Mime...)
+				writeBytes.Write(header[0:1])
+				writeBytes.Write(n.Mime)
 			}
 			if n.HasLastModifiedDate() {
 				util.Uint64toBytes(header[0:8], n.LastModified)
-				writeBytes = append(writeBytes, header[8-LastModifiedBytesLength:8]...)
+				writeBytes.Write(header[8-LastModifiedBytesLength:8])
 			}
 			if n.HasTtl() && n.Ttl != nil {
 				n.Ttl.ToBytes(header[0:TtlBytesLength])
-				writeBytes = append(writeBytes, header[0:TtlBytesLength]...)
+				writeBytes.Write(header[0:TtlBytesLength])
 			}
 			if n.HasPairs() {
 				util.Uint16toBytes(header[0:2], n.PairsSize)
-				writeBytes = append(writeBytes, header[0:2]...)
-				writeBytes = append(writeBytes, n.Pairs...)
+				writeBytes.Write(header[0:2])
+				writeBytes.Write(n.Pairs)
 			}
 		}
 		padding := PaddingLength(n.Size, version)
 		util.Uint32toBytes(header[0:NeedleChecksumSize], n.Checksum.Value())
 		if version == Version2 {
-			writeBytes = append(writeBytes, header[0:NeedleChecksumSize+padding]...)
+			writeBytes.Write(header[0:NeedleChecksumSize+padding])
 		} else {
 			// version3
 			util.Uint64toBytes(header[NeedleChecksumSize:NeedleChecksumSize+TimestampSize], n.AppendAtNs)
-			writeBytes = append(writeBytes, header[0:NeedleChecksumSize+TimestampSize+padding]...)
+			writeBytes.Write(header[0:NeedleChecksumSize+TimestampSize+padding])
 		}
 
-		return writeBytes, Size(n.DataSize), GetActualSize(n.Size, version), nil
+		return Size(n.DataSize), GetActualSize(n.Size, version), nil
 	}
 
-	return writeBytes, 0, 0, fmt.Errorf("Unsupported Version! (%d)", version)
+	return 0, 0, fmt.Errorf("Unsupported Version! (%d)", version)
 }
 
 func (n *Needle) Append(w backend.BackendStorageFile, version Version) (offset uint64, size Size, actualSize int64, err error) {
@@ -147,13 +152,45 @@ func (n *Needle) Append(w backend.BackendStorageFile, version Version) (offset u
 		return
 	}
 
-	bytesToWrite, size, actualSize, err := n.prepareWriteBuffer(version)
+	bytesBuffer := bufPool.Get().(*bytes.Buffer)
+	defer bufPool.Put(bytesBuffer)
+
+	size, actualSize, err = n.prepareWriteBuffer(version, bytesBuffer)
 
 	if err == nil {
-		_, err = w.WriteAt(bytesToWrite, int64(offset))
+		_, err = w.WriteAt(bytesBuffer.Bytes(), int64(offset))
 	}
 
 	return offset, size, actualSize, err
+}
+
+func WriteNeedleBlob(w backend.BackendStorageFile, dataSlice []byte, size Size, appendAtNs uint64, version Version) (offset uint64, err error) {
+
+	if end, _, e := w.GetStat(); e == nil {
+		defer func(w backend.BackendStorageFile, off int64) {
+			if err != nil {
+				if te := w.Truncate(end); te != nil {
+					glog.V(0).Infof("Failed to truncate %s back to %d with error: %v", w.Name(), end, te)
+				}
+			}
+		}(w, end)
+		offset = uint64(end)
+	} else {
+		err = fmt.Errorf("Cannot Read Current Volume Position: %v", e)
+		return
+	}
+
+	if version == Version3 {
+		tsOffset := NeedleHeaderSize + size + NeedleChecksumSize
+		util.Uint64toBytes(dataSlice[tsOffset:tsOffset+TimestampSize], appendAtNs)
+	}
+
+	if err == nil {
+		_, err = w.WriteAt(dataSlice, int64(offset))
+	}
+
+	return
+
 }
 
 func ReadNeedleBlob(r backend.BackendStorageFile, offset int64, size Size, version Version) (dataSlice []byte, err error) {
@@ -168,7 +205,7 @@ func ReadNeedleBlob(r backend.BackendStorageFile, offset int64, size Size, versi
 	}
 	if err != nil {
 		fileSize, _, _ := r.GetStat()
-		println("n",n, "dataSize", dataSize, "offset", offset, "fileSize", fileSize)
+		println("n", n, "dataSize", dataSize, "offset", offset, "fileSize", fileSize)
 	}
 	return dataSlice, err
 

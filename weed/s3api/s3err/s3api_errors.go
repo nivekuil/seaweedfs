@@ -15,11 +15,13 @@ type APIError struct {
 
 // RESTErrorResponse - error response format
 type RESTErrorResponse struct {
-	XMLName   xml.Name `xml:"Error" json:"-"`
-	Code      string   `xml:"Code" json:"Code"`
-	Message   string   `xml:"Message" json:"Message"`
-	Resource  string   `xml:"Resource" json:"Resource"`
-	RequestID string   `xml:"RequestId" json:"RequestId"`
+	XMLName    xml.Name `xml:"Error" json:"-"`
+	Code       string   `xml:"Code" json:"Code"`
+	Message    string   `xml:"Message" json:"Message"`
+	Resource   string   `xml:"Resource" json:"Resource"`
+	RequestID  string   `xml:"RequestId" json:"RequestId"`
+	Key        string   `xml:"Key,omitempty" json:"Key,omitempty"`
+	BucketName string   `xml:"BucketName,omitempty" json:"BucketName,omitempty"`
 
 	// Underlying HTTP status code for the returned error
 	StatusCode int `xml:"-" json:"-"`
@@ -91,7 +93,9 @@ const (
 	ErrRequestNotReadyYet
 	ErrMissingDateHeader
 	ErrInvalidRequest
+	ErrAuthNotSetup
 	ErrNotImplemented
+	ErrPreconditionFailed
 
 	ErrExistingObjectIsDirectory
 )
@@ -116,7 +120,7 @@ var errorCodeResponse = map[ErrorCode]APIError{
 	},
 	ErrBucketAlreadyExists: {
 		Code:           "BucketAlreadyExists",
-		Description:    "The requested bucket name is not available. The bucket namespace is shared by all users of the system. Please select a different name and try again.",
+		Description:    "The requested bucket name is not available. The bucket name can not be an existing collection, and the bucket namespace is shared by all users of the system. Please select a different name and try again.",
 		HTTPStatusCode: http.StatusConflict,
 	},
 	ErrBucketAlreadyOwnedByYou: {
@@ -341,10 +345,20 @@ var errorCodeResponse = map[ErrorCode]APIError{
 		Description:    "Invalid Request",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
+	ErrAuthNotSetup: {
+		Code:           "InvalidRequest",
+		Description:    "Signed request requires setting up SeaweedFS S3 authentication",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
 	ErrNotImplemented: {
 		Code:           "NotImplemented",
 		Description:    "A header you provided implies functionality that is not implemented",
 		HTTPStatusCode: http.StatusNotImplemented,
+	},
+	ErrPreconditionFailed: {
+		Code:           "PreconditionFailed",
+		Description:    "At least one of the pre-conditions you specified did not hold",
+		HTTPStatusCode: http.StatusPreconditionFailed,
 	},
 	ErrExistingObjectIsDirectory: {
 		Code:           "ExistingObjectIsDirectory",

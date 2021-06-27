@@ -3,6 +3,8 @@ package pb
 import (
 	"context"
 	"fmt"
+	"github.com/chrislusf/seaweedfs/weed/glog"
+	"math/rand"
 	"net/http"
 	"strconv"
 	"strings"
@@ -23,9 +25,15 @@ const (
 
 var (
 	// cache grpc connections
-	grpcClients     = make(map[string]*grpc.ClientConn)
+	grpcClients     = make(map[string]*versionedGrpcClient)
 	grpcClientsLock sync.Mutex
 )
+
+type versionedGrpcClient struct {
+	*grpc.ClientConn
+	version  int
+	errCount int
+}
 
 func init() {
 	http.DefaultTransport.(*http.Transport).MaxIdleConnsPerHost = 1024
@@ -42,7 +50,7 @@ func NewGrpcServer(opts ...grpc.ServerOption) *grpc.Server {
 		}),
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
 			MinTime:             60 * time.Second, // min time a client should wait before sending a ping
-			PermitWithoutStream: false,
+			PermitWithoutStream: true,
 		}),
 		grpc.MaxRecvMsgSize(Max_Message_Size),
 		grpc.MaxSendMsgSize(Max_Message_Size),
@@ -68,7 +76,7 @@ func GrpcDial(ctx context.Context, address string, opts ...grpc.DialOption) (*gr
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
 			Time:                30 * time.Second, // client ping server if no activity for this long
 			Timeout:             20 * time.Second,
-			PermitWithoutStream: false,
+			PermitWithoutStream: true,
 		}))
 	for _, opt := range opts {
 		if opt != nil {
@@ -78,7 +86,7 @@ func GrpcDial(ctx context.Context, address string, opts ...grpc.DialOption) (*gr
 	return grpc.DialContext(ctx, address, options...)
 }
 
-func getOrCreateConnection(address string, opts ...grpc.DialOption) (*grpc.ClientConn, error) {
+func getOrCreateConnection(address string, opts ...grpc.DialOption) (*versionedGrpcClient, error) {
 
 	grpcClientsLock.Lock()
 	defer grpcClientsLock.Unlock()
@@ -93,66 +101,102 @@ func getOrCreateConnection(address string, opts ...grpc.DialOption) (*grpc.Clien
 		return nil, fmt.Errorf("fail to dial %s: %v", address, err)
 	}
 
-	grpcClients[address] = grpcConnection
+	vgc := &versionedGrpcClient{
+		grpcConnection,
+		rand.Int(),
+		0,
+	}
+	grpcClients[address] = vgc
 
-	return grpcConnection, nil
+	return vgc, nil
 }
 
 func WithCachedGrpcClient(fn func(*grpc.ClientConn) error, address string, opts ...grpc.DialOption) error {
 
-	grpcConnection, err := getOrCreateConnection(address, opts...)
+	vgc, err := getOrCreateConnection(address, opts...)
 	if err != nil {
 		return fmt.Errorf("getOrCreateConnection %s: %v", address, err)
 	}
-	return fn(grpcConnection)
+	executionErr := fn(vgc.ClientConn)
+	if executionErr != nil {
+		vgc.errCount++
+		if vgc.errCount > 3 ||
+			strings.Contains(executionErr.Error(), "transport") ||
+			strings.Contains(executionErr.Error(), "connection closed") {
+			grpcClientsLock.Lock()
+			if t, ok := grpcClients[address]; ok {
+				if t.version == vgc.version {
+					vgc.Close()
+					delete(grpcClients, address)
+				}
+			}
+			grpcClientsLock.Unlock()
+		}
+	}
+
+	return executionErr
 }
 
 func ParseServerToGrpcAddress(server string) (serverGrpcAddress string, err error) {
-	colonIndex := strings.LastIndex(server, ":")
-	if colonIndex < 0 {
-		return "", fmt.Errorf("server should have hostname:port format: %v", server)
+	return ParseServerAddress(server, 10000)
+}
+func ParseServersToGrpcAddresses(servers []string) (serverGrpcAddresses []string, err error) {
+	for _, server := range servers {
+		if serverGrpcAddress, parseErr := ParseServerToGrpcAddress(server); parseErr == nil {
+			serverGrpcAddresses = append(serverGrpcAddresses, serverGrpcAddress)
+		} else {
+			return nil, parseErr
+		}
 	}
+	return
+}
 
-	port, parseErr := strconv.ParseUint(server[colonIndex+1:], 10, 64)
+func ParseServerAddress(server string, deltaPort int) (newServerAddress string, err error) {
+
+	host, port, parseErr := hostAndPort(server)
 	if parseErr != nil {
 		return "", fmt.Errorf("server port parse error: %v", parseErr)
 	}
 
-	grpcPort := int(port) + 10000
+	newPort := int(port) + deltaPort
 
-	return fmt.Sprintf("%s:%d", server[:colonIndex], grpcPort), nil
+	return fmt.Sprintf("%s:%d", host, newPort), nil
+}
+
+func hostAndPort(address string) (host string, port uint64, err error) {
+	colonIndex := strings.LastIndex(address, ":")
+	if colonIndex < 0 {
+		return "", 0, fmt.Errorf("server should have hostname:port format: %v", address)
+	}
+	port, err = strconv.ParseUint(address[colonIndex+1:], 10, 64)
+	if err != nil {
+		return "", 0, fmt.Errorf("server port parse error: %v", err)
+	}
+
+	return address[:colonIndex], port, err
 }
 
 func ServerToGrpcAddress(server string) (serverGrpcAddress string) {
-	hostnameAndPort := strings.Split(server, ":")
-	if len(hostnameAndPort) != 2 {
-		return fmt.Sprintf("unexpected server address: %s", server)
-	}
 
-	port, parseErr := strconv.ParseUint(hostnameAndPort[1], 10, 64)
+	host, port, parseErr := hostAndPort(server)
 	if parseErr != nil {
-		return fmt.Sprintf("failed to parse port for %s:%s", hostnameAndPort[0], hostnameAndPort[1])
+		glog.Fatalf("server address %s parse error: %v", server, parseErr)
 	}
 
 	grpcPort := int(port) + 10000
 
-	return fmt.Sprintf("%s:%d", hostnameAndPort[0], grpcPort)
+	return fmt.Sprintf("%s:%d", host, grpcPort)
 }
 
 func GrpcAddressToServerAddress(grpcAddress string) (serverAddress string) {
-	hostnameAndPort := strings.Split(grpcAddress, ":")
-	if len(hostnameAndPort) != 2 {
-		return fmt.Sprintf("unexpected grpcAddress: %s", grpcAddress)
-	}
-
-	grpcPort, parseErr := strconv.ParseUint(hostnameAndPort[1], 10, 64)
+	host, grpcPort, parseErr := hostAndPort(grpcAddress)
 	if parseErr != nil {
-		return fmt.Sprintf("failed to parse port for %s:%s", hostnameAndPort[0], hostnameAndPort[1])
+		glog.Fatalf("server grpc address %s parse error: %v", grpcAddress, parseErr)
 	}
 
 	port := int(grpcPort) - 10000
 
-	return fmt.Sprintf("%s:%d", hostnameAndPort[0], port)
+	return fmt.Sprintf("%s:%d", host, port)
 }
 
 func WithMasterClient(master string, grpcDialOption grpc.DialOption, fn func(client master_pb.SeaweedClient) error) error {
@@ -198,18 +242,17 @@ func WithGrpcFilerClient(filerGrpcAddress string, grpcDialOption grpc.DialOption
 
 }
 
-func ParseFilerGrpcAddress(filer string) (filerGrpcAddress string, err error) {
-	hostnameAndPort := strings.Split(filer, ":")
-	if len(hostnameAndPort) != 2 {
-		return "", fmt.Errorf("filer should have hostname:port format: %v", hostnameAndPort)
+func WithOneOfGrpcFilerClients(filerGrpcAddresses []string, grpcDialOption grpc.DialOption, fn func(client filer_pb.SeaweedFilerClient) error) (err error) {
+
+	for _, filerGrpcAddress := range filerGrpcAddresses {
+		err = WithCachedGrpcClient(func(grpcConnection *grpc.ClientConn) error {
+			client := filer_pb.NewSeaweedFilerClient(grpcConnection)
+			return fn(client)
+		}, filerGrpcAddress, grpcDialOption)
+		if err == nil {
+			return nil
+		}
 	}
 
-	filerPort, parseErr := strconv.ParseUint(hostnameAndPort[1], 10, 64)
-	if parseErr != nil {
-		return "", fmt.Errorf("filer port parse error: %v", parseErr)
-	}
-
-	filerGrpcPort := int(filerPort) + 10000
-
-	return fmt.Sprintf("%s:%d", hostnameAndPort[0], filerGrpcPort), nil
+	return err
 }

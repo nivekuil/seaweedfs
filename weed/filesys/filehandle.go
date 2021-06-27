@@ -20,28 +20,33 @@ import (
 
 type FileHandle struct {
 	// cache file has been written to
-	dirtyPages  *ContinuousDirtyPages
-	contentType string
-	handle      uint64
-	sync.RWMutex
+	dirtyPages     DirtyPages
+	entryViewCache []filer.VisibleInterval
+	reader         io.ReaderAt
+	contentType    string
+	handle         uint64
+	sync.Mutex
 
 	f         *File
 	RequestId fuse.RequestID // unique ID for request
 	NodeId    fuse.NodeID    // file or directory the request is about
 	Uid       uint32         // user ID of process making request
 	Gid       uint32         // group ID of process making request
-
+	writeOnly bool
+	isDeleted bool
 }
 
-func newFileHandle(file *File, uid, gid uint32) *FileHandle {
+func newFileHandle(file *File, uid, gid uint32, writeOnly bool) *FileHandle {
 	fh := &FileHandle{
-		f:          file,
-		dirtyPages: newDirtyPages(file),
+		f: file,
+		// dirtyPages: newContinuousDirtyPages(file, writeOnly),
+		dirtyPages: newTempFileDirtyPages(file, writeOnly),
 		Uid:        uid,
 		Gid:        gid,
 	}
-	if fh.f.entry != nil {
-		fh.f.entry.Attributes.FileSize = filer.FileSize(fh.f.entry)
+	entry := fh.f.getEntry()
+	if entry != nil {
+		entry.Attributes.FileSize = filer.FileSize(entry)
 	}
 
 	return fh
@@ -58,8 +63,8 @@ var _ = fs.HandleReleaser(&FileHandle{})
 func (fh *FileHandle) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
 
 	glog.V(4).Infof("%s read fh %d: [%d,%d) size %d resp.Data cap=%d", fh.f.fullpath(), fh.handle, req.Offset, req.Offset+int64(req.Size), req.Size, cap(resp.Data))
-	fh.RLock()
-	defer fh.RUnlock()
+	fh.Lock()
+	defer fh.Unlock()
 
 	if req.Size <= 0 {
 		return nil
@@ -104,42 +109,48 @@ func (fh *FileHandle) readFromDirtyPages(buff []byte, startOffset int64) (maxSto
 
 func (fh *FileHandle) readFromChunks(buff []byte, offset int64) (int64, error) {
 
-	fileSize := int64(filer.FileSize(fh.f.entry))
-
-	if fileSize == 0 {
-		glog.V(1).Infof("empty fh %v", fh.f.fullpath())
+	entry := fh.f.getEntry()
+	if entry == nil {
 		return 0, io.EOF
 	}
 
-	if offset+int64(len(buff)) <= int64(len(fh.f.entry.Content)) {
-		totalRead := copy(buff, fh.f.entry.Content[offset:])
-		glog.V(4).Infof("file handle read cached %s [%d,%d] %d", fh.f.fullpath(), offset, offset+int64(totalRead), totalRead)
+	fileSize := int64(filer.FileSize(entry))
+	fileFullPath := fh.f.fullpath()
+
+	if fileSize == 0 {
+		glog.V(1).Infof("empty fh %v", fileFullPath)
+		return 0, io.EOF
+	}
+
+	if offset+int64(len(buff)) <= int64(len(entry.Content)) {
+		totalRead := copy(buff, entry.Content[offset:])
+		glog.V(4).Infof("file handle read cached %s [%d,%d] %d", fileFullPath, offset, offset+int64(totalRead), totalRead)
 		return int64(totalRead), nil
 	}
 
 	var chunkResolveErr error
-	if fh.f.entryViewCache == nil {
-		fh.f.entryViewCache, chunkResolveErr = filer.NonOverlappingVisibleIntervals(fh.f.wfs.LookupFn(), fh.f.entry.Chunks)
+	if fh.entryViewCache == nil {
+		fh.entryViewCache, chunkResolveErr = filer.NonOverlappingVisibleIntervals(fh.f.wfs.LookupFn(), entry.Chunks)
 		if chunkResolveErr != nil {
 			return 0, fmt.Errorf("fail to resolve chunk manifest: %v", chunkResolveErr)
 		}
-		fh.f.reader = nil
+		fh.reader = nil
 	}
 
-	reader := fh.f.reader
+	reader := fh.reader
 	if reader == nil {
-		chunkViews := filer.ViewFromVisibleIntervals(fh.f.entryViewCache, 0, math.MaxInt64)
+		chunkViews := filer.ViewFromVisibleIntervals(fh.entryViewCache, 0, math.MaxInt64)
 		reader = filer.NewChunkReaderAtFromClient(fh.f.wfs.LookupFn(), chunkViews, fh.f.wfs.chunkCache, fileSize)
 	}
-	fh.f.reader = reader
+	fh.reader = reader
 
 	totalRead, err := reader.ReadAt(buff, offset)
 
 	if err != nil && err != io.EOF {
-		glog.Errorf("file handle read %s: %v", fh.f.fullpath(), err)
+		glog.Errorf("file handle read %s: %v", fileFullPath, err)
 	}
 
-	glog.V(4).Infof("file handle read %s [%d,%d] %d : %v", fh.f.fullpath(), offset, offset+int64(totalRead), totalRead, err)
+	// glog.V(4).Infof("file handle read %s [%d,%d] %d : %v", fileFullPath, offset, offset+int64(totalRead), totalRead, err)
 
 	return int64(totalRead), err
 }
@@ -158,9 +169,14 @@ func (fh *FileHandle) Write(ctx context.Context, req *fuse.WriteRequest, resp *f
 		copy(data, req.Data)
 	}
 
-	fh.f.entry.Content = nil
-	fh.f.entry.Attributes.FileSize = uint64(max(req.Offset+int64(len(data)), int64(fh.f.entry.Attributes.FileSize)))
-	glog.V(4).Infof("%v write [%d,%d) %d", fh.f.fullpath(), req.Offset, req.Offset+int64(len(req.Data)), len(req.Data))
+	entry := fh.f.getEntry()
+	if entry == nil {
+		return fuse.EIO
+	}
+
+	entry.Content = nil
+	entry.Attributes.FileSize = uint64(max(req.Offset+int64(len(data)), int64(entry.Attributes.FileSize)))
+	// glog.V(4).Infof("%v write [%d,%d) %d", fh.f.fullpath(), req.Offset, req.Offset+int64(len(req.Data)), len(req.Data))
 
 	fh.dirtyPages.AddPage(req.Offset, data)
 
@@ -179,28 +195,25 @@ func (fh *FileHandle) Write(ctx context.Context, req *fuse.WriteRequest, resp *f
 
 func (fh *FileHandle) Release(ctx context.Context, req *fuse.ReleaseRequest) error {
 
-	glog.V(4).Infof("Release %v fh %d", fh.f.fullpath(), fh.handle)
+	glog.V(4).Infof("Release %v fh %d open=%d", fh.f.fullpath(), fh.handle, fh.f.isOpen)
 
 	fh.Lock()
 	defer fh.Unlock()
 
+	fh.f.isOpen--
+
 	if fh.f.isOpen <= 0 {
+		fh.f.entry = nil
+		fh.entryViewCache = nil
+		fh.reader = nil
+
+		fh.f.wfs.ReleaseHandle(fh.f.fullpath(), fuse.HandleID(fh.handle))
+	}
+
+	if fh.f.isOpen < 0 {
 		glog.V(0).Infof("Release reset %s open count %d => %d", fh.f.Name, fh.f.isOpen, 0)
 		fh.f.isOpen = 0
 		return nil
-	}
-
-	if fh.f.isOpen == 1 {
-
-		fh.f.isOpen--
-
-		fh.f.wfs.ReleaseHandle(fh.f.fullpath(), fuse.HandleID(fh.handle))
-		if closer, ok := fh.f.reader.(io.Closer); ok {
-			if closer != nil {
-				closer.Close()
-			}
-		}
-		fh.f.reader = nil
 	}
 
 	return nil
@@ -209,6 +222,11 @@ func (fh *FileHandle) Release(ctx context.Context, req *fuse.ReleaseRequest) err
 func (fh *FileHandle) Flush(ctx context.Context, req *fuse.FlushRequest) error {
 
 	glog.V(4).Infof("Flush %v fh %d", fh.f.fullpath(), fh.handle)
+
+	if fh.isDeleted {
+		glog.V(4).Infof("Flush %v fh %d skip deleted", fh.f.fullpath(), fh.handle)
+		return nil
+	}
 
 	fh.Lock()
 	defer fh.Unlock()
@@ -227,12 +245,8 @@ func (fh *FileHandle) doFlush(ctx context.Context, header fuse.Header) error {
 	// send the data to the OS
 	glog.V(4).Infof("doFlush %s fh %d", fh.f.fullpath(), fh.handle)
 
-	fh.dirtyPages.saveExistingPagesToStorage()
-
-	fh.dirtyPages.writeWaitGroup.Wait()
-
-	if fh.dirtyPages.lastErr != nil {
-		glog.Errorf("%v doFlush last err: %v", fh.f.fullpath(), fh.dirtyPages.lastErr)
+	if err := fh.dirtyPages.FlushData(); err != nil {
+		glog.Errorf("%v doFlush: %v", fh.f.fullpath(), err)
 		return fuse.EIO
 	}
 
@@ -242,43 +256,47 @@ func (fh *FileHandle) doFlush(ctx context.Context, header fuse.Header) error {
 
 	err := fh.f.wfs.WithFilerClient(func(client filer_pb.SeaweedFilerClient) error {
 
-		if fh.f.entry.Attributes != nil {
-			fh.f.entry.Attributes.Mime = fh.contentType
-			if fh.f.entry.Attributes.Uid == 0 {
-				fh.f.entry.Attributes.Uid = header.Uid
+		entry := fh.f.getEntry()
+		if entry == nil {
+			return nil
+		}
+
+		if entry.Attributes != nil {
+			entry.Attributes.Mime = fh.contentType
+			if entry.Attributes.Uid == 0 {
+				entry.Attributes.Uid = header.Uid
 			}
-			if fh.f.entry.Attributes.Gid == 0 {
-				fh.f.entry.Attributes.Gid = header.Gid
+			if entry.Attributes.Gid == 0 {
+				entry.Attributes.Gid = header.Gid
 			}
-			if fh.f.entry.Attributes.Crtime == 0 {
-				fh.f.entry.Attributes.Crtime = time.Now().Unix()
+			if entry.Attributes.Crtime == 0 {
+				entry.Attributes.Crtime = time.Now().Unix()
 			}
-			fh.f.entry.Attributes.Mtime = time.Now().Unix()
-			fh.f.entry.Attributes.FileMode = uint32(os.FileMode(fh.f.entry.Attributes.FileMode) &^ fh.f.wfs.option.Umask)
-			fh.f.entry.Attributes.Collection = fh.dirtyPages.collection
-			fh.f.entry.Attributes.Replication = fh.dirtyPages.replication
+			entry.Attributes.Mtime = time.Now().Unix()
+			entry.Attributes.FileMode = uint32(os.FileMode(entry.Attributes.FileMode) &^ fh.f.wfs.option.Umask)
+			entry.Attributes.Collection, entry.Attributes.Replication = fh.dirtyPages.GetStorageOptions()
 		}
 
 		request := &filer_pb.CreateEntryRequest{
 			Directory:  fh.f.dir.FullPath(),
-			Entry:      fh.f.entry,
+			Entry:      entry,
 			Signatures: []int32{fh.f.wfs.signature},
 		}
 
-		glog.V(4).Infof("%s set chunks: %v", fh.f.fullpath(), len(fh.f.entry.Chunks))
-		for i, chunk := range fh.f.entry.Chunks {
+		glog.V(4).Infof("%s set chunks: %v", fh.f.fullpath(), len(entry.Chunks))
+		for i, chunk := range entry.Chunks {
 			glog.V(4).Infof("%s chunks %d: %v [%d,%d)", fh.f.fullpath(), i, chunk.GetFileIdString(), chunk.Offset, chunk.Offset+int64(chunk.Size))
 		}
 
-		manifestChunks, nonManifestChunks := filer.SeparateManifestChunks(fh.f.entry.Chunks)
+		manifestChunks, nonManifestChunks := filer.SeparateManifestChunks(entry.Chunks)
 
 		chunks, _ := filer.CompactFileChunks(fh.f.wfs.LookupFn(), nonManifestChunks)
-		chunks, manifestErr := filer.MaybeManifestize(fh.f.wfs.saveDataAsChunk(fh.f.fullpath()), chunks)
+		chunks, manifestErr := filer.MaybeManifestize(fh.f.wfs.saveDataAsChunk(fh.f.fullpath(), fh.dirtyPages.GetWriteOnly()), chunks)
 		if manifestErr != nil {
 			// not good, but should be ok
 			glog.V(0).Infof("MaybeManifestize: %v", manifestErr)
 		}
-		fh.f.entry.Chunks = append(chunks, manifestChunks...)
+		entry.Chunks = append(chunks, manifestChunks...)
 
 		fh.f.wfs.mapPbIdFromLocalToFiler(request.Entry)
 		defer fh.f.wfs.mapPbIdFromFilerToLocal(request.Entry)

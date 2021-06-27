@@ -80,10 +80,14 @@ func (ms *MasterServer) SendHeartbeat(stream master_pb.Seaweed_SendHeartbeatServ
 		dn.AdjustMaxVolumeCounts(heartbeat.MaxVolumeCounts)
 
 		glog.V(4).Infof("master received heartbeat %s", heartbeat.String())
+		var dataCenter string
+		if dc := dn.GetDataCenter(); dc != nil {
+			dataCenter = string(dc.Id())
+		}
 		message := &master_pb.VolumeLocation{
 			Url:        dn.Url(),
 			PublicUrl:  dn.PublicUrl,
-			DataCenter: string(dn.GetDataCenter().Id()),
+			DataCenter: dataCenter,
 		}
 		if len(heartbeat.NewVolumes) > 0 || len(heartbeat.DeletedVolumes) > 0 {
 			// process delta volume ids if exists for fast volume id updates
@@ -201,8 +205,8 @@ func (ms *MasterServer) KeepConnected(stream master_pb.Seaweed_KeepConnectedServ
 			_, err := stream.Recv()
 			if err != nil {
 				glog.V(2).Infof("- client %v: %v", clientName, err)
-				stopChan <- true
-				break
+				close(stopChan)
+				return
 			}
 		}
 	}()

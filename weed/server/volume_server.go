@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"github.com/chrislusf/seaweedfs/weed/storage/types"
 	"net/http"
+	"sync"
 
 	"google.golang.org/grpc"
 
@@ -34,11 +35,15 @@ type VolumeServer struct {
 	fileSizeLimitBytes      int64
 	isHeartbeating          bool
 	stopChan                chan bool
+
+	inFlightDataSize      int64
+	inFlightDataLimitCond *sync.Cond
+	concurrentUploadLimit int64
 }
 
 func NewVolumeServer(adminMux, publicMux *http.ServeMux, ip string,
 	port int, publicUrl string,
-	folders []string, maxCounts []int, minFreeSpacePercents []float32, diskTypes []types.DiskType,
+	folders []string, maxCounts []int, minFreeSpaces []util.MinFreeSpace, diskTypes []types.DiskType,
 	idxFolder string,
 	needleMapKind storage.NeedleMapKind,
 	masterNodes []string, pulseSeconds int,
@@ -48,6 +53,7 @@ func NewVolumeServer(adminMux, publicMux *http.ServeMux, ip string,
 	readRedirect bool,
 	compactionMBPerSecond int,
 	fileSizeLimitMB int,
+	concurrentUploadLimit int64,
 ) *VolumeServer {
 
 	v := util.GetViper()
@@ -72,12 +78,14 @@ func NewVolumeServer(adminMux, publicMux *http.ServeMux, ip string,
 		fileSizeLimitBytes:      int64(fileSizeLimitMB) * 1024 * 1024,
 		isHeartbeating:          true,
 		stopChan:                make(chan bool),
+		inFlightDataLimitCond:   sync.NewCond(new(sync.Mutex)),
+		concurrentUploadLimit:   concurrentUploadLimit,
 	}
 	vs.SeedMasterNodes = masterNodes
 
 	vs.checkWithMaster()
 
-	vs.store = storage.NewStore(vs.grpcDialOption, port, ip, publicUrl, folders, maxCounts, minFreeSpacePercents, idxFolder, vs.needleMapKind, diskTypes)
+	vs.store = storage.NewStore(vs.grpcDialOption, port, ip, publicUrl, folders, maxCounts, minFreeSpaces, idxFolder, vs.needleMapKind, diskTypes)
 	vs.guard = security.NewGuard(whiteList, signingKey, expiresAfterSec, readSigningKey, readExpiresAfterSec)
 
 	handleStaticResources(adminMux)

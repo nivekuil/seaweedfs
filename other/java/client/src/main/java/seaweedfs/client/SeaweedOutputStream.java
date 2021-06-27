@@ -8,6 +8,7 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.io.InterruptedIOException;
 import java.io.OutputStream;
+import java.nio.Buffer;
 import java.nio.ByteBuffer;
 import java.util.concurrent.*;
 
@@ -38,7 +39,7 @@ public class SeaweedOutputStream extends OutputStream {
     }
 
     public SeaweedOutputStream(FilerClient filerClient, final String fullpath, final String replication) {
-        this(filerClient, fullpath, null, 0, 8 * 1024 * 1024, "000");
+        this(filerClient, fullpath, null, 0, 8 * 1024 * 1024, replication);
     }
 
     public SeaweedOutputStream(FilerClient filerClient, final String path, FilerProto.Entry.Builder entry,
@@ -217,7 +218,7 @@ public class SeaweedOutputStream extends OutputStream {
 
     private synchronized int submitWriteBufferToService(final ByteBuffer bufferToWrite, final long writePosition) throws IOException {
 
-        bufferToWrite.flip();
+        ((Buffer)bufferToWrite).flip();
         int bytesLength = bufferToWrite.limit() - bufferToWrite.position();
 
         if (threadExecutor.getQueue().size() >= maxConcurrentRequestCount) {

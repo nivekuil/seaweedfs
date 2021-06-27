@@ -5,11 +5,15 @@ import (
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
+	"github.com/chrislusf/seaweedfs/weed/filer"
+	"github.com/pquerna/cachecontrol/cacheobject"
 	"io"
 	"io/ioutil"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/chrislusf/seaweedfs/weed/s3api/s3err"
 
@@ -40,13 +44,27 @@ func (s3a *S3ApiServer) PutObjectHandler(w http.ResponseWriter, r *http.Request)
 
 	_, err := validateContentMd5(r.Header)
 	if err != nil {
-		writeErrorResponse(w, s3err.ErrInvalidDigest, r.URL)
+		s3err.WriteErrorResponse(w, s3err.ErrInvalidDigest, r)
 		return
 	}
 
+	if r.Header.Get("Cache-Control") != "" {
+		if _, err = cacheobject.ParseRequestCacheControl(r.Header.Get("Cache-Control")); err != nil {
+			s3err.WriteErrorResponse(w, s3err.ErrInvalidDigest, r)
+			return
+		}
+	}
+
+	if r.Header.Get("Expires") != "" {
+		if _, err = time.Parse(http.TimeFormat, r.Header.Get("Expires")); err != nil {
+			s3err.WriteErrorResponse(w, s3err.ErrInvalidDigest, r)
+			return
+		}
+	}
+
 	dataReader := r.Body
+	rAuthType := getRequestAuthType(r)
 	if s3a.iam.isEnabled() {
-		rAuthType := getRequestAuthType(r)
 		var s3ErrCode s3err.ErrorCode
 		switch rAuthType {
 		case authTypeStreamingSigned:
@@ -57,7 +75,12 @@ func (s3a *S3ApiServer) PutObjectHandler(w http.ResponseWriter, r *http.Request)
 			_, s3ErrCode = s3a.iam.reqSignatureV4Verify(r)
 		}
 		if s3ErrCode != s3err.ErrNone {
-			writeErrorResponse(w, s3ErrCode, r.URL)
+			s3err.WriteErrorResponse(w, s3ErrCode, r)
+			return
+		}
+	} else {
+		if authTypeStreamingSigned == rAuthType {
+			s3err.WriteErrorResponse(w, s3err.ErrAuthNotSetup, r)
 			return
 		}
 	}
@@ -65,16 +88,16 @@ func (s3a *S3ApiServer) PutObjectHandler(w http.ResponseWriter, r *http.Request)
 
 	if strings.HasSuffix(object, "/") {
 		if err := s3a.mkdir(s3a.option.BucketsPath, bucket+object, nil); err != nil {
-			writeErrorResponse(w, s3err.ErrInternalError, r.URL)
+			s3err.WriteErrorResponse(w, s3err.ErrInternalError, r)
 			return
 		}
 	} else {
-		uploadUrl := fmt.Sprintf("http://%s%s/%s%s", s3a.option.Filer, s3a.option.BucketsPath, bucket, object)
+		uploadUrl := fmt.Sprintf("http://%s%s/%s%s", s3a.option.Filer, s3a.option.BucketsPath, bucket, urlPathEscape(object))
 
 		etag, errCode := s3a.putToFiler(r, uploadUrl, dataReader)
 
 		if errCode != s3err.ErrNone {
-			writeErrorResponse(w, errCode, r.URL)
+			s3err.WriteErrorResponse(w, errCode, r)
 			return
 		}
 
@@ -84,17 +107,25 @@ func (s3a *S3ApiServer) PutObjectHandler(w http.ResponseWriter, r *http.Request)
 	writeSuccessResponseEmpty(w)
 }
 
+func urlPathEscape(object string) string {
+	var escapedParts []string
+	for _, part := range strings.Split(object, "/") {
+		escapedParts = append(escapedParts, url.PathEscape(part))
+	}
+	return strings.Join(escapedParts, "/")
+}
+
 func (s3a *S3ApiServer) GetObjectHandler(w http.ResponseWriter, r *http.Request) {
 
 	bucket, object := getBucketAndObject(r)
 
 	if strings.HasSuffix(r.URL.Path, "/") {
-		writeErrorResponse(w, s3err.ErrNotImplemented, r.URL)
+		s3err.WriteErrorResponse(w, s3err.ErrNotImplemented, r)
 		return
 	}
 
 	destUrl := fmt.Sprintf("http://%s%s/%s%s",
-		s3a.option.Filer, s3a.option.BucketsPath, bucket, object)
+		s3a.option.Filer, s3a.option.BucketsPath, bucket, urlPathEscape(object))
 
 	s3a.proxyToFiler(w, r, destUrl, passThroughResponse)
 
@@ -105,7 +136,7 @@ func (s3a *S3ApiServer) HeadObjectHandler(w http.ResponseWriter, r *http.Request
 	bucket, object := getBucketAndObject(r)
 
 	destUrl := fmt.Sprintf("http://%s%s/%s%s",
-		s3a.option.Filer, s3a.option.BucketsPath, bucket, object)
+		s3a.option.Filer, s3a.option.BucketsPath, bucket, urlPathEscape(object))
 
 	s3a.proxyToFiler(w, r, destUrl, passThroughResponse)
 
@@ -116,7 +147,7 @@ func (s3a *S3ApiServer) DeleteObjectHandler(w http.ResponseWriter, r *http.Reque
 	bucket, object := getBucketAndObject(r)
 
 	destUrl := fmt.Sprintf("http://%s%s/%s%s?recursive=true",
-		s3a.option.Filer, s3a.option.BucketsPath, bucket, object)
+		s3a.option.Filer, s3a.option.BucketsPath, bucket, urlPathEscape(object))
 
 	s3a.proxyToFiler(w, r, destUrl, func(proxyResponse *http.Response, w http.ResponseWriter) {
 		for k, v := range proxyResponse.Header {
@@ -164,13 +195,13 @@ func (s3a *S3ApiServer) DeleteMultipleObjectsHandler(w http.ResponseWriter, r *h
 
 	deleteXMLBytes, err := ioutil.ReadAll(r.Body)
 	if err != nil {
-		writeErrorResponse(w, s3err.ErrInternalError, r.URL)
+		s3err.WriteErrorResponse(w, s3err.ErrInternalError, r)
 		return
 	}
 
 	deleteObjects := &DeleteObjectsRequest{}
 	if err := xml.Unmarshal(deleteXMLBytes, deleteObjects); err != nil {
-		writeErrorResponse(w, s3err.ErrMalformedXML, r.URL)
+		s3err.WriteErrorResponse(w, s3err.ErrMalformedXML, r)
 		return
 	}
 
@@ -196,6 +227,8 @@ func (s3a *S3ApiServer) DeleteMultipleObjectsHandler(w http.ResponseWriter, r *h
 			if err == nil {
 				directoriesWithDeletion[parentDirectoryPath]++
 				deletedObjects = append(deletedObjects, object)
+			} else if strings.Contains(err.Error(), filer.MsgFailDelNonEmptyFolder) {
+				deletedObjects = append(deletedObjects, object)
 			} else {
 				delete(directoriesWithDeletion, parentDirectoryPath)
 				deleteErrors = append(deleteErrors, DeleteError{
@@ -220,7 +253,7 @@ func (s3a *S3ApiServer) DeleteMultipleObjectsHandler(w http.ResponseWriter, r *h
 	}
 	deleteResp.Errors = deleteErrors
 
-	writeSuccessResponseXML(w, encodeResponse(deleteResp))
+	writeSuccessResponseXML(w, deleteResp)
 
 }
 
@@ -264,7 +297,7 @@ func (s3a *S3ApiServer) proxyToFiler(w http.ResponseWriter, r *http.Request, des
 
 	if err != nil {
 		glog.Errorf("NewRequest %s: %v", destUrl, err)
-		writeErrorResponse(w, s3err.ErrInternalError, r.URL)
+		s3err.WriteErrorResponse(w, s3err.ErrInternalError, r)
 		return
 	}
 
@@ -294,14 +327,19 @@ func (s3a *S3ApiServer) proxyToFiler(w http.ResponseWriter, r *http.Request, des
 
 	if postErr != nil {
 		glog.Errorf("post to filer: %v", postErr)
-		writeErrorResponse(w, s3err.ErrInternalError, r.URL)
+		s3err.WriteErrorResponse(w, s3err.ErrInternalError, r)
 		return
 	}
 	defer util.CloseResponse(resp)
 
-	if (resp.ContentLength == -1 || resp.StatusCode == 404) && !strings.HasSuffix(destUrl, "/") {
+	if resp.StatusCode == http.StatusPreconditionFailed {
+		s3err.WriteErrorResponse(w, s3err.ErrPreconditionFailed, r)
+		return
+	}
+
+	if (resp.ContentLength == -1 || resp.StatusCode == 404) && resp.StatusCode != 304 {
 		if r.Method != "DELETE" {
-			writeErrorResponse(w, s3err.ErrNoSuchKey, r.URL)
+			s3err.WriteErrorResponse(w, s3err.ErrNoSuchKey, r)
 			return
 		}
 	}
@@ -314,7 +352,11 @@ func passThroughResponse(proxyResponse *http.Response, w http.ResponseWriter) {
 	for k, v := range proxyResponse.Header {
 		w.Header()[k] = v
 	}
-	w.WriteHeader(proxyResponse.StatusCode)
+	if proxyResponse.Header.Get("Content-Range") != "" && proxyResponse.StatusCode == 200 {
+		w.WriteHeader(http.StatusPartialContent)
+	} else {
+		w.WriteHeader(proxyResponse.StatusCode)
+	}
 	io.Copy(w, proxyResponse.Body)
 }
 

@@ -3,6 +3,7 @@ package command
 import (
 	"context"
 	"fmt"
+	"github.com/chrislusf/seaweedfs/weed/filer"
 	"io"
 	"io/ioutil"
 	"net/http"
@@ -46,6 +47,8 @@ type CopyOptions struct {
 	masters           []string
 	cipher            bool
 	ttlSec            int32
+	checkSize         *bool
+	verbose           *bool
 }
 
 func init() {
@@ -56,9 +59,11 @@ func init() {
 	copy.collection = cmdCopy.Flag.String("collection", "", "optional collection name")
 	copy.ttl = cmdCopy.Flag.String("ttl", "", "time to live, e.g.: 1m, 1h, 1d, 1M, 1y")
 	copy.diskType = cmdCopy.Flag.String("disk", "", "[hdd|ssd|<tag>] hard drive or solid state drive or any tag")
-	copy.maxMB = cmdCopy.Flag.Int("maxMB", 32, "split files larger than the limit")
+	copy.maxMB = cmdCopy.Flag.Int("maxMB", 4, "split files larger than the limit")
 	copy.concurrenctFiles = cmdCopy.Flag.Int("c", 8, "concurrent file copy goroutines")
 	copy.concurrenctChunks = cmdCopy.Flag.Int("concurrentChunks", 8, "concurrent chunk copy goroutines for each file")
+	copy.checkSize = cmdCopy.Flag.Bool("check.size", false, "copy when the target file size is different from the source file")
+	copy.verbose = cmdCopy.Flag.Bool("verbose", false, "print out details during copying")
 }
 
 var cmdCopy = &Command{
@@ -207,25 +212,29 @@ func genFileCopyTask(fileOrDir string, destPath string, fileCopyTaskChan chan Fi
 	}
 
 	mode := fi.Mode()
-	if mode.IsDir() {
-		files, _ := ioutil.ReadDir(fileOrDir)
-		for _, subFileOrDir := range files {
-			if err = genFileCopyTask(fileOrDir+"/"+subFileOrDir.Name(), destPath+fi.Name()+"/", fileCopyTaskChan); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-
 	uid, gid := util.GetFileUidGid(fi)
+	fileSize := fi.Size()
+	if mode.IsDir() {
+		fileSize = 0
+	}
 
 	fileCopyTaskChan <- FileCopyTask{
 		sourceLocation:     fileOrDir,
 		destinationUrlPath: destPath,
-		fileSize:           fi.Size(),
+		fileSize:           fileSize,
 		fileMode:           fi.Mode(),
 		uid:                uid,
 		gid:                gid,
+	}
+
+	if mode.IsDir() {
+		files, _ := ioutil.ReadDir(fileOrDir)
+		for _, subFileOrDir := range files {
+			cleanedDestDirectory := filepath.Clean(destPath + fi.Name())
+			if err = genFileCopyTask(fileOrDir+"/"+subFileOrDir.Name(), cleanedDestDirectory+"/", fileCopyTaskChan); err != nil {
+				return err
+			}
+		}
 	}
 
 	return nil
@@ -275,6 +284,15 @@ func (worker *FileCopyWorker) doEachCopy(task FileCopyTask) error {
 		}
 	}
 
+	if shouldCopy, err := worker.checkExistingFileFirst(task, f); err != nil {
+		return fmt.Errorf("check existing file: %v", err)
+	} else if !shouldCopy {
+		if *worker.options.verbose {
+			fmt.Printf("skipping copied file: %v\n", f.Name())
+		}
+		return nil
+	}
+
 	// find the chunk count
 	chunkSize := int64(*worker.options.maxMB * 1024 * 1024)
 	chunkCount := 1
@@ -289,42 +307,82 @@ func (worker *FileCopyWorker) doEachCopy(task FileCopyTask) error {
 	return worker.uploadFileInChunks(task, f, chunkCount, chunkSize)
 }
 
+func (worker *FileCopyWorker) checkExistingFileFirst(task FileCopyTask, f *os.File) (shouldCopy bool, err error) {
+
+	shouldCopy = true
+
+	if !*worker.options.checkSize {
+		return
+	}
+
+	fileStat, err := f.Stat()
+	if err != nil {
+		shouldCopy = false
+		return
+	}
+
+	err = pb.WithGrpcFilerClient(worker.filerGrpcAddress, worker.options.grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
+
+		request := &filer_pb.LookupDirectoryEntryRequest{
+			Directory: task.destinationUrlPath,
+			Name:      filepath.Base(f.Name()),
+		}
+
+		resp, lookupErr := client.LookupDirectoryEntry(context.Background(), request)
+		if lookupErr != nil {
+			// mostly not found error
+			return nil
+		}
+
+		if fileStat.Size() == int64(filer.FileSize(resp.Entry)) {
+			shouldCopy = false
+		}
+
+		return nil
+	})
+	return
+}
+
 func (worker *FileCopyWorker) uploadFileAsOne(task FileCopyTask, f *os.File) error {
 
 	// upload the file content
 	fileName := filepath.Base(f.Name())
-	mimeType := detectMimeType(f)
-	data, err := ioutil.ReadAll(f)
-	if err != nil {
-		return err
-	}
+	var mimeType string
 
 	var chunks []*filer_pb.FileChunk
 	var assignResult *filer_pb.AssignVolumeResponse
 	var assignError error
 
-	if task.fileSize > 0 {
+	if task.fileMode&os.ModeDir == 0 && task.fileSize > 0 {
+
+		mimeType = detectMimeType(f)
+		data, err := ioutil.ReadAll(f)
+		if err != nil {
+			return err
+		}
 
 		// assign a volume
-		err := pb.WithGrpcFilerClient(worker.filerGrpcAddress, worker.options.grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
+		err = util.Retry("assignVolume", func() error {
+			return pb.WithGrpcFilerClient(worker.filerGrpcAddress, worker.options.grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
 
-			request := &filer_pb.AssignVolumeRequest{
-				Count:       1,
-				Replication: *worker.options.replication,
-				Collection:  *worker.options.collection,
-				TtlSec:      worker.options.ttlSec,
-				DiskType:    *worker.options.diskType,
-				Path:        task.destinationUrlPath,
-			}
+				request := &filer_pb.AssignVolumeRequest{
+					Count:       1,
+					Replication: *worker.options.replication,
+					Collection:  *worker.options.collection,
+					TtlSec:      worker.options.ttlSec,
+					DiskType:    *worker.options.diskType,
+					Path:        task.destinationUrlPath,
+				}
 
-			assignResult, assignError = client.AssignVolume(context.Background(), request)
-			if assignError != nil {
-				return fmt.Errorf("assign volume failure %v: %v", request, assignError)
-			}
-			if assignResult.Error != "" {
-				return fmt.Errorf("assign volume failure %v: %v", request, assignResult.Error)
-			}
-			return nil
+				assignResult, assignError = client.AssignVolume(context.Background(), request)
+				if assignError != nil {
+					return fmt.Errorf("assign volume failure %v: %v", request, assignError)
+				}
+				if assignResult.Error != "" {
+					return fmt.Errorf("assign volume failure %v: %v", request, assignResult.Error)
+				}
+				return nil
+			})
 		})
 		if err != nil {
 			return fmt.Errorf("Failed to assign from %v: %v\n", worker.options.masters, err)
@@ -339,11 +397,13 @@ func (worker *FileCopyWorker) uploadFileAsOne(task FileCopyTask, f *os.File) err
 		if uploadResult.Error != "" {
 			return fmt.Errorf("upload %v to %s result: %v\n", fileName, targetUrl, uploadResult.Error)
 		}
-		fmt.Printf("uploaded %s to %s\n", fileName, targetUrl)
+		if *worker.options.verbose {
+			fmt.Printf("uploaded %s to %s\n", fileName, targetUrl)
+		}
 
 		chunks = append(chunks, uploadResult.ToPbFileChunk(assignResult.FileId, 0))
 
-		fmt.Printf("copied %s => http://%s%s%s\n", fileName, worker.filerHost, task.destinationUrlPath, fileName)
+		fmt.Printf("copied %s => http://%s%s%s\n", f.Name(), worker.filerHost, task.destinationUrlPath, fileName)
 	}
 
 	if err := pb.WithGrpcFilerClient(worker.filerGrpcAddress, worker.options.grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
@@ -402,28 +462,27 @@ func (worker *FileCopyWorker) uploadFileInChunks(task FileCopyTask, f *os.File, 
 			// assign a volume
 			var assignResult *filer_pb.AssignVolumeResponse
 			var assignError error
-			err := pb.WithGrpcFilerClient(worker.filerGrpcAddress, worker.options.grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
-				request := &filer_pb.AssignVolumeRequest{
-					Count:       1,
-					Replication: *worker.options.replication,
-					Collection:  *worker.options.collection,
-					TtlSec:      worker.options.ttlSec,
-					DiskType:    *worker.options.diskType,
-					Path:        task.destinationUrlPath + fileName,
-				}
+			err := util.Retry("assignVolume", func() error {
+				return pb.WithGrpcFilerClient(worker.filerGrpcAddress, worker.options.grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
+					request := &filer_pb.AssignVolumeRequest{
+						Count:       1,
+						Replication: *worker.options.replication,
+						Collection:  *worker.options.collection,
+						TtlSec:      worker.options.ttlSec,
+						DiskType:    *worker.options.diskType,
+						Path:        task.destinationUrlPath + fileName,
+					}
 
-				assignResult, assignError = client.AssignVolume(context.Background(), request)
-				if assignError != nil {
-					return fmt.Errorf("assign volume failure %v: %v", request, assignError)
-				}
-				if assignResult.Error != "" {
-					return fmt.Errorf("assign volume failure %v: %v", request, assignResult.Error)
-				}
-				return nil
+					assignResult, assignError = client.AssignVolume(context.Background(), request)
+					if assignError != nil {
+						return fmt.Errorf("assign volume failure %v: %v", request, assignError)
+					}
+					if assignResult.Error != "" {
+						return fmt.Errorf("assign volume failure %v: %v", request, assignResult.Error)
+					}
+					return nil
+				})
 			})
-			if err != nil {
-				fmt.Printf("Failed to assign from %v: %v\n", worker.options.masters, err)
-			}
 			if err != nil {
 				fmt.Printf("Failed to assign from %v: %v\n", worker.options.masters, err)
 			}
@@ -498,7 +557,7 @@ func (worker *FileCopyWorker) uploadFileInChunks(task FileCopyTask, f *os.File, 
 		return fmt.Errorf("upload data %v to http://%s%s%s: %v\n", fileName, worker.filerHost, task.destinationUrlPath, fileName, err)
 	}
 
-	fmt.Printf("copied %s => http://%s%s%s\n", fileName, worker.filerHost, task.destinationUrlPath, fileName)
+	fmt.Printf("copied %s => http://%s%s%s\n", f.Name(), worker.filerHost, task.destinationUrlPath, fileName)
 
 	return nil
 }

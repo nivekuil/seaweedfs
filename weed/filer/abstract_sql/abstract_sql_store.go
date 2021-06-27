@@ -10,18 +10,19 @@ import (
 	"github.com/chrislusf/seaweedfs/weed/util"
 	"strings"
 	"sync"
+	"time"
 )
 
 type SqlGenerator interface {
-	GetSqlInsert(bucket string) string
-	GetSqlUpdate(bucket string) string
-	GetSqlFind(bucket string) string
-	GetSqlDelete(bucket string) string
-	GetSqlDeleteFolderChildren(bucket string) string
-	GetSqlListExclusive(bucket string) string
-	GetSqlListInclusive(bucket string) string
-	GetSqlCreateTable(bucket string) string
-	GetSqlDropTable(bucket string) string
+	GetSqlInsert(tableName string) string
+	GetSqlUpdate(tableName string) string
+	GetSqlFind(tableName string) string
+	GetSqlDelete(tableName string) string
+	GetSqlDeleteFolderChildren(tableName string) string
+	GetSqlListExclusive(tableName string) string
+	GetSqlListInclusive(tableName string) string
+	GetSqlCreateTable(tableName string) string
+	GetSqlDropTable(tableName string) string
 }
 
 type AbstractSqlStore struct {
@@ -30,6 +31,32 @@ type AbstractSqlStore struct {
 	SupportBucketTable bool
 	dbs                map[string]bool
 	dbsLock            sync.Mutex
+}
+
+func (store *AbstractSqlStore) CanDropWholeBucket() bool {
+	return store.SupportBucketTable
+}
+func (store *AbstractSqlStore) OnBucketCreation(bucket string) {
+	store.dbsLock.Lock()
+	defer store.dbsLock.Unlock()
+
+	store.CreateTable(context.Background(), bucket)
+
+	if store.dbs == nil {
+		return
+	}
+	store.dbs[bucket] = true
+}
+func (store *AbstractSqlStore) OnBucketDeletion(bucket string) {
+	store.dbsLock.Lock()
+	defer store.dbsLock.Unlock()
+
+	store.deleteTable(context.Background(), bucket)
+
+	if store.dbs == nil {
+		return
+	}
+	delete(store.dbs, bucket)
 }
 
 const (
@@ -235,7 +262,7 @@ func (store *AbstractSqlStore) DeleteEntry(ctx context.Context, fullpath util.Fu
 	return nil
 }
 
-func (store *AbstractSqlStore) DeleteFolderChildren(ctx context.Context, fullpath util.FullPath) error {
+func (store *AbstractSqlStore) DeleteFolderChildren(ctx context.Context, fullpath util.FullPath, limit int64) error {
 
 	db, bucket, shortPath, err := store.getTxOrDB(ctx, fullpath, true)
 	if err != nil {
@@ -253,16 +280,23 @@ func (store *AbstractSqlStore) DeleteFolderChildren(ctx context.Context, fullpat
 		}
 	}
 
-	res, err := db.ExecContext(ctx, store.GetSqlDeleteFolderChildren(bucket), util.HashStringToLong(string(shortPath)), fullpath)
-	if err != nil {
-		return fmt.Errorf("deleteFolderChildren %s: %s", fullpath, err)
-	}
+	for {
+		glog.V(4).Infof("delete %s SQL %s %d", string(shortPath), store.GetSqlDeleteFolderChildren(bucket), util.HashStringToLong(string(shortPath)))
+		res, err := db.ExecContext(ctx, store.GetSqlDeleteFolderChildren(bucket), util.HashStringToLong(string(shortPath)), string(shortPath), limit)
+		if err != nil {
+			return fmt.Errorf("deleteFolderChildren %s: %s", fullpath, err)
+		}
 
-	_, err = res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("deleteFolderChildren %s but no rows affected: %s", fullpath, err)
+		rowCount, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("deleteFolderChildren %s but no rows affected: %s", fullpath, err)
+		}
+		if rowCount < limit {
+			break
+		}
+		// to give the Galera Cluster a chance to breath
+		time.Sleep(time.Second)
 	}
-
 	return nil
 }
 

@@ -8,6 +8,7 @@ import (
 	"crypto/md5"
 	"fmt"
 	"io"
+	"os"
 
 	"github.com/tecbot/gorocksdb"
 
@@ -56,6 +57,7 @@ func (store *RocksDBStore) Initialize(configuration weed_util.Configuration, pre
 
 func (store *RocksDBStore) initialize(dir string) (err error) {
 	glog.Infof("filer store rocksdb dir: %s", dir)
+	os.MkdirAll(dir, 0755)
 	if err := weed_util.TestFolderWritable(dir); err != nil {
 		return fmt.Errorf("Check Level Folder %s Writable: %s", dir, err)
 	}
@@ -146,7 +148,7 @@ func (store *RocksDBStore) DeleteEntry(ctx context.Context, fullpath weed_util.F
 	return nil
 }
 
-func (store *RocksDBStore) DeleteFolderChildren(ctx context.Context, fullpath weed_util.FullPath) (err error) {
+func (store *RocksDBStore) DeleteFolderChildren(ctx context.Context, fullpath weed_util.FullPath, limit int64) (err error) {
 	directoryPrefix := genDirectoryKeyPrefix(fullpath, "")
 
 	batch := gorocksdb.NewWriteBatch()

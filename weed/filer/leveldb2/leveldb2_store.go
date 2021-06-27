@@ -38,6 +38,7 @@ func (store *LevelDB2Store) Initialize(configuration weed_util.Configuration, pr
 
 func (store *LevelDB2Store) initialize(dir string, dbCount int) (err error) {
 	glog.Infof("filer store leveldb2 dir: %s", dir)
+	os.MkdirAll(dir, 0755)
 	if err := weed_util.TestFolderWritable(dir); err != nil {
 		return fmt.Errorf("Check Level Folder %s Writable: %s", dir, err)
 	}
@@ -143,7 +144,7 @@ func (store *LevelDB2Store) DeleteEntry(ctx context.Context, fullpath weed_util.
 	return nil
 }
 
-func (store *LevelDB2Store) DeleteFolderChildren(ctx context.Context, fullpath weed_util.FullPath) (err error) {
+func (store *LevelDB2Store) DeleteFolderChildren(ctx context.Context, fullpath weed_util.FullPath, limit int64) (err error) {
 	directoryPrefix, partitionId := genDirectoryKeyPrefix(fullpath, "", store.dbCount)
 
 	batch := new(leveldb.Batch)

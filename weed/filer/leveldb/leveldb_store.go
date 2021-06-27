@@ -8,6 +8,7 @@ import (
 	leveldb_errors "github.com/syndtr/goleveldb/leveldb/errors"
 	"github.com/syndtr/goleveldb/leveldb/opt"
 	leveldb_util "github.com/syndtr/goleveldb/leveldb/util"
+	"os"
 
 	"github.com/chrislusf/seaweedfs/weed/filer"
 	"github.com/chrislusf/seaweedfs/weed/glog"
@@ -38,6 +39,7 @@ func (store *LevelDBStore) Initialize(configuration weed_util.Configuration, pre
 
 func (store *LevelDBStore) initialize(dir string) (err error) {
 	glog.Infof("filer store dir: %s", dir)
+	os.MkdirAll(dir, 0755)
 	if err := weed_util.TestFolderWritable(dir); err != nil {
 		return fmt.Errorf("Check Level Folder %s Writable: %s", dir, err)
 	}
@@ -134,7 +136,7 @@ func (store *LevelDBStore) DeleteEntry(ctx context.Context, fullpath weed_util.F
 	return nil
 }
 
-func (store *LevelDBStore) DeleteFolderChildren(ctx context.Context, fullpath weed_util.FullPath) (err error) {
+func (store *LevelDBStore) DeleteFolderChildren(ctx context.Context, fullpath weed_util.FullPath, limit int64) (err error) {
 
 	batch := new(leveldb.Batch)
 

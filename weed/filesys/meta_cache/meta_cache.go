@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"strings"
 	"sync"
 
 	"github.com/chrislusf/seaweedfs/weed/filer"
@@ -31,9 +30,6 @@ func NewMetaCache(dbFolder string, baseDir util.FullPath, uidGidMapper *UidGidMa
 		visitedBoundary: bounded_tree.NewBoundedTree(baseDir),
 		uidGidMapper:    uidGidMapper,
 		invalidateFunc: func(fullpath util.FullPath) {
-			if baseDir != "/" && strings.HasPrefix(string(fullpath), string(baseDir)) {
-				fullpath = fullpath[len(baseDir):]
-			}
 			invalidateFunc(fullpath)
 		},
 	}
@@ -78,7 +74,7 @@ func (mc *MetaCache) AtomicUpdateEntryFromFiler(ctx context.Context, oldPath uti
 				// skip the unnecessary deletion
 				// leave the update to the following InsertEntry operation
 			} else {
-				glog.V(3).Infof("DeleteEntry %s/%s", oldPath, oldPath.Name())
+				glog.V(3).Infof("DeleteEntry %s", oldPath)
 				if err := mc.localStore.DeleteEntry(ctx, oldPath); err != nil {
 					return err
 				}
